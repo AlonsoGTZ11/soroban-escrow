@@ -480,13 +480,23 @@ mod tests {
         env.mock_all_auths();
         let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
         let client = EscrowContractClient::new(&env, &contract_id);
+        let token_client = token::Client::new(&env, &token);
         client.initialize(&admin);
 
-        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        let escrow_amount = 100;
+        let escrow_id =
+            client.create_escrow(&depositor, &beneficiary, &token, &escrow_amount, &0u64);
+        let depositor_balance_before_refund = token_client.balance(&depositor);
+
         client.dispute(&escrow_id);
         assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Disputed);
         client.refund(&escrow_id);
+
         assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Refunded);
+        assert_eq!(
+            token_client.balance(&depositor),
+            depositor_balance_before_refund + escrow_amount
+        );
     }
 
     #[test]
