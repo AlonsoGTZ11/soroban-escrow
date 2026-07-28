@@ -353,8 +353,7 @@ impl EscrowContract {
 
         let current_time = env.ledger().timestamp();
 
-        for i in 0..children.len() {
-            let child_id = children.get(i).unwrap();
+        for child_id in children.iter() {
             let mut child: Escrow = match env.storage().persistent().get(&DataKey::Escrow(child_id))
             {
                 Some(e) => e,
@@ -450,9 +449,10 @@ impl EscrowContract {
             data.push_back(*byte);
         }
 
-        // Append blinding factor (32 bytes)
-        for i in 0..32 {
-            data.push_back(blinding_factor.get(i).unwrap());
+        // Append blinding factor (32 bytes) — convert to slice
+        let blinding_bytes: &[u8; 32] = &blinding_factor.to_bytes();
+        for byte in blinding_bytes.iter() {
+            data.push_back(*byte);
         }
 
         env.crypto().sha256(&data)
@@ -638,6 +638,20 @@ mod tests {
         StellarAssetClient::new(env, &token).mint(&depositor, &10_000);
         let contract_id = env.register(EscrowContract, ());
         (admin, depositor, beneficiary, token, contract_id)
+    }
+
+    /// Helper: compute commitment for tests
+    fn compute_test_commitment(env: &Env, amount: i128, blinding_factor: BytesN<32>) -> BytesN<32> {
+        let mut data: Vec<u8> = vec![env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            data.push_back(*byte);
+        }
+        let blinding_bytes: &[u8; 32] = &blinding_factor.to_bytes();
+        for byte in blinding_bytes.iter() {
+            data.push_back(*byte);
+        }
+        env.crypto().sha256(&data)
     }
 
     // ── Original tests ────────────────────────────────────────────────────────
