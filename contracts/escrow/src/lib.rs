@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, Symbol, Vec, BytesN};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, vec, Address, BytesN, Env, Symbol, Vec,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,11 +340,7 @@ impl EscrowContract {
     /// status matches the parent's current status and whose release_time has passed.
     /// Recursively triggers grandchildren.
     pub fn trigger_children(env: Env, parent_id: u64) {
-        let parent: Escrow = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(parent_id))
-        {
+        let parent: Escrow = match env.storage().persistent().get(&DataKey::Escrow(parent_id)) {
             Some(e) => e,
             None => return,
         };
@@ -357,10 +355,7 @@ impl EscrowContract {
 
         for i in 0..children.len() {
             let child_id = children.get(i).unwrap();
-            let mut child: Escrow = match env
-                .storage()
-                .persistent()
-                .get(&DataKey::Escrow(child_id))
+            let mut child: Escrow = match env.storage().persistent().get(&DataKey::Escrow(child_id))
             {
                 Some(e) => e,
                 None => continue,
@@ -425,11 +420,7 @@ impl EscrowContract {
     fn is_ancestor(env: &Env, start_id: u64, ancestor_id: u64) -> bool {
         let mut current = start_id;
         for _ in 0..64u32 {
-            let escrow: Escrow = match env
-                .storage()
-                .persistent()
-                .get(&DataKey::Escrow(current))
-            {
+            let escrow: Escrow = match env.storage().persistent().get(&DataKey::Escrow(current)) {
                 Some(e) => e,
                 None => return false,
             };
@@ -450,24 +441,20 @@ impl EscrowContract {
 
     /// Compute commitment: SHA-256(amount_bytes || blinding_factor)
     /// amount is encoded as 16 bytes (i128 big-endian)
-    fn compute_commitment(
-        env: &Env,
-        amount: i128,
-        blinding_factor: BytesN<32>,
-    ) -> BytesN<32> {
+    fn compute_commitment(env: &Env, amount: i128, blinding_factor: BytesN<32>) -> BytesN<32> {
         let mut data: Vec<u8> = vec![env];
-        
+
         // Append amount as big-endian 16 bytes
         let amount_bytes = amount.to_be_bytes();
         for byte in amount_bytes.iter() {
             data.push_back(*byte);
         }
-        
+
         // Append blinding factor (32 bytes)
         for i in 0..32 {
             data.push_back(blinding_factor.get(i).unwrap());
         }
-        
+
         env.crypto().sha256(&data)
     }
 
@@ -594,11 +581,7 @@ impl EscrowContract {
         let token_client = token::Client::new(&env, &escrow.token);
         let balance = token_client.balance(&env.current_contract_address());
         if balance > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &escrow.depositor,
-                &balance,
-            );
+            token_client.transfer(&env.current_contract_address(), &escrow.depositor, &balance);
         }
 
         escrow.status = CommitmentEscrowStatus::Refunded;
@@ -831,12 +814,22 @@ mod tests {
 
         let parent_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
         let child1 = client.create_child_escrow(
-            &depositor, &beneficiary, &token, &10, &0u64,
-            &parent_id, &EscrowStatus::Released,
+            &depositor,
+            &beneficiary,
+            &token,
+            &10,
+            &0u64,
+            &parent_id,
+            &EscrowStatus::Released,
         );
         let child2 = client.create_child_escrow(
-            &depositor, &beneficiary, &token, &20, &0u64,
-            &parent_id, &EscrowStatus::Released,
+            &depositor,
+            &beneficiary,
+            &token,
+            &20,
+            &0u64,
+            &parent_id,
+            &EscrowStatus::Released,
         );
 
         let children = client.get_child_escrows(&parent_id);
@@ -854,21 +847,33 @@ mod tests {
         let client = EscrowContractClient::new(&env, &contract_id);
         client.initialize(&admin);
 
-        let grandparent_id =
-            client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        let grandparent_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
         let parent_id = client.create_child_escrow(
-            &depositor, &beneficiary, &token, &50, &0u64,
-            &grandparent_id, &EscrowStatus::Released,
+            &depositor,
+            &beneficiary,
+            &token,
+            &50,
+            &0u64,
+            &grandparent_id,
+            &EscrowStatus::Released,
         );
         let child_id = client.create_child_escrow(
-            &depositor, &beneficiary, &token, &25, &0u64,
-            &parent_id, &EscrowStatus::Released,
+            &depositor,
+            &beneficiary,
+            &token,
+            &25,
+            &0u64,
+            &parent_id,
+            &EscrowStatus::Released,
         );
 
         // Releasing the root should cascade all the way down
         client.release(&grandparent_id);
 
-        assert_eq!(client.get_escrow(&grandparent_id).status, EscrowStatus::Released);
+        assert_eq!(
+            client.get_escrow(&grandparent_id).status,
+            EscrowStatus::Released
+        );
         assert_eq!(client.get_escrow(&parent_id).status, EscrowStatus::Released);
         assert_eq!(client.get_escrow(&child_id).status, EscrowStatus::Released);
     }
@@ -894,8 +899,13 @@ mod tests {
         // Build chain A(1) ← B(2)
         let id_a = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64); // 1
         let id_b = client.create_child_escrow(
-            &depositor, &beneficiary, &token, &50, &0u64,
-            &id_a, &EscrowStatus::Released,
+            &depositor,
+            &beneficiary,
+            &token,
+            &50,
+            &0u64,
+            &id_a,
+            &EscrowStatus::Released,
         ); // 2
 
         // Inject back-edge and reset counter — must be done inside the contract context.
@@ -922,8 +932,13 @@ mod tests {
 
         // This must panic with "Circular dependency detected".
         client.create_child_escrow(
-            &depositor, &beneficiary, &token, &10, &0u64,
-            &id_b, &EscrowStatus::Released,
+            &depositor,
+            &beneficiary,
+            &token,
+            &10,
+            &0u64,
+            &id_b,
+            &EscrowStatus::Released,
         );
     }
 
@@ -942,8 +957,8 @@ mod tests {
         let blinding_factor = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
 
@@ -954,8 +969,8 @@ mod tests {
             BytesN::from_array(
                 &env,
                 &[
-                    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
-                    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+                    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+                    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
                 ],
             ) // placeholder
         });
@@ -972,13 +987,8 @@ mod tests {
         }
         let commitment = env.crypto().sha256(&commitment_data);
 
-        let escrow_id = client.create_commitment_escrow(
-            &depositor,
-            &beneficiary,
-            &token,
-            &commitment,
-            &0u64,
-        );
+        let escrow_id =
+            client.create_commitment_escrow(&depositor, &beneficiary, &token, &commitment, &0u64);
 
         // Depositor transfers funds to contract
         let token_client = soroban_sdk::token::Client::new(&env, &token);
@@ -1006,8 +1016,8 @@ mod tests {
         let blinding_factor = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
 
@@ -1021,13 +1031,8 @@ mod tests {
         }
         let commitment = env.crypto().sha256(&commitment_data);
 
-        let escrow_id = client.create_commitment_escrow(
-            &depositor,
-            &beneficiary,
-            &token,
-            &commitment,
-            &0u64,
-        );
+        let escrow_id =
+            client.create_commitment_escrow(&depositor, &beneficiary, &token, &commitment, &0u64);
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         token_client.transfer(&depositor, &contract_id, &amount);
@@ -1050,15 +1055,15 @@ mod tests {
         let blinding_factor = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
         let wrong_blinding_factor = BytesN::from_array(
             &env,
             &[
-                32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13,
-                12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+                32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12,
+                11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
             ],
         );
 
@@ -1072,13 +1077,8 @@ mod tests {
         }
         let commitment = env.crypto().sha256(&commitment_data);
 
-        let escrow_id = client.create_commitment_escrow(
-            &depositor,
-            &beneficiary,
-            &token,
-            &commitment,
-            &0u64,
-        );
+        let escrow_id =
+            client.create_commitment_escrow(&depositor, &beneficiary, &token, &commitment, &0u64);
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         token_client.transfer(&depositor, &contract_id, &amount);
@@ -1101,8 +1101,8 @@ mod tests {
         let blinding_factor = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
 
@@ -1116,13 +1116,8 @@ mod tests {
         }
         let commitment = env.crypto().sha256(&commitment_data);
 
-        let escrow_id = client.create_commitment_escrow(
-            &depositor,
-            &beneficiary,
-            &token,
-            &commitment,
-            &0u64,
-        );
+        let escrow_id =
+            client.create_commitment_escrow(&depositor, &beneficiary, &token, &commitment, &0u64);
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         token_client.transfer(&depositor, &contract_id, &amount);
@@ -1148,8 +1143,8 @@ mod tests {
         let blinding_factor = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
 
@@ -1175,7 +1170,8 @@ mod tests {
         token_client.transfer(&depositor, &contract_id, &amount);
 
         // Attempt to release before release_time should fail
-        let result = client.try_reveal_and_release(&depositor, &escrow_id, &amount, &blinding_factor);
+        let result =
+            client.try_reveal_and_release(&depositor, &escrow_id, &amount, &blinding_factor);
         assert!(result.is_err());
     }
 
@@ -1192,8 +1188,8 @@ mod tests {
         let blinding_factor = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
 
@@ -1207,13 +1203,8 @@ mod tests {
         }
         let commitment = env.crypto().sha256(&commitment_data);
 
-        let escrow_id = client.create_commitment_escrow(
-            &depositor,
-            &beneficiary,
-            &token,
-            &commitment,
-            &0u64,
-        );
+        let escrow_id =
+            client.create_commitment_escrow(&depositor, &beneficiary, &token, &commitment, &0u64);
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         token_client.transfer(&depositor, &contract_id, &amount);
@@ -1237,8 +1228,8 @@ mod tests {
         let commitment = BytesN::from_array(
             &env,
             &[
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ],
         );
 
