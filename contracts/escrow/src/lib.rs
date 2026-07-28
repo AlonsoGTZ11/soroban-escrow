@@ -295,6 +295,11 @@ impl EscrowContract {
             .expect("Escrow not found")
     }
 
+    /// Get only the escrow status.
+    pub fn get_escrow_status(env: Env, escrow_id: u64) -> EscrowStatus {
+        Self::get_escrow(env, escrow_id).status
+    }
+
     /// Get total escrow count.
     pub fn get_count(env: Env) -> u64 {
         env.storage()
@@ -462,6 +467,18 @@ mod tests {
     }
 
     #[test]
+    fn test_get_escrow_status_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Active);
+    }
+
+    #[test]
     fn test_release() {
         let env = Env::default();
         env.mock_all_auths();
@@ -472,6 +489,7 @@ mod tests {
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
         client.release(&escrow_id);
         assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Released);
+        assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Released);
     }
 
     #[test]
@@ -484,9 +502,47 @@ mod tests {
 
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
         client.dispute(&escrow_id);
-        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Disputed);
+        assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Disputed);
         client.refund(&escrow_id);
-        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Refunded);
+        assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn test_get_escrow_status_disputed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        client.dispute(&escrow_id);
+        assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Disputed);
+    }
+
+    #[test]
+    fn test_get_escrow_status_refunded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        client.refund(&escrow_id);
+        assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Refunded);
+    }
+
+    #[test]
+    #[should_panic(expected = "Escrow not found")]
+    fn test_get_escrow_status_missing_escrow_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _, _, _, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        client.get_escrow_status(&999u64);
     }
 
     #[test]
