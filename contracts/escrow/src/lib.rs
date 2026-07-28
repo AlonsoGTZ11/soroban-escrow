@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, Symbol, Vec, BytesN};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8,6 +8,14 @@ pub enum EscrowStatus {
     Released,
     Refunded,
     Disputed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitmentEscrowStatus {
+    Active,
+    Revealed,
+    Refunded,
 }
 
 /// Encodes the optional parent-status gate.
@@ -34,6 +42,19 @@ pub struct Escrow {
     pub required_parent_status: ParentStatusRequirement,
 }
 
+/// Commitment-based escrow: amount is hidden using Pedersen commitment (SHA-256).
+/// No plaintext amount is stored on-chain for privacy.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CommitmentEscrow {
+    pub depositor: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub commitment: BytesN<32>, // SHA-256(amount || blinding_factor)
+    pub status: CommitmentEscrowStatus,
+    pub release_time: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Escrow(u64),
@@ -41,6 +62,8 @@ pub enum DataKey {
     Admin,
     /// Stores Vec<u64> of child escrow IDs for a given parent ID.
     ChildEscrows(u64),
+    CommitmentEscrow(u64),
+    CommitmentEscrowCount,
 }
 
 #[contract]
@@ -422,6 +445,195 @@ impl EscrowContract {
         }
         false
     }
+
+    // ── Commitment-based Escrow Functions ─────────────────────────────────────
+
+    /// Compute commitment: SHA-256(amount_bytes || blinding_factor)
+    /// amount is encoded as 16 bytes (i128 big-endian)
+    fn compute_commitment(
+        env: &Env,
+        amount: i128,
+        blinding_factor: BytesN<32>,
+    ) -> BytesN<32> {
+        let mut data: Vec<u8> = vec![env];
+        
+        // Append amount as big-endian 16 bytes
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            data.push_back(*byte);
+        }
+        
+        // Append blinding factor (32 bytes)
+        for i in 0..32 {
+            data.push_back(blinding_factor.get(i).unwrap());
+        }
+        
+        env.crypto().sha256(&data)
+    }
+
+    /// Create a commitment-based escrow with hidden amount.
+    /// Depositor must separately transfer funds to the contract (amount unknown to observers).
+    #[allow(deprecated)]
+    pub fn create_commitment_escrow(
+        env: Env,
+        depositor: Address,
+        beneficiary: Address,
+        token: Address,
+        commitment: BytesN<32>,
+        release_time: u64,
+    ) -> u64 {
+        depositor.require_auth();
+
+        let escrow_id = Self::next_commitment_id(&env);
+
+        let escrow = CommitmentEscrow {
+            depositor,
+            beneficiary,
+            token,
+            commitment,
+            status: CommitmentEscrowStatus::Active,
+            release_time,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentEscrow(escrow_id), &escrow);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "commitment_escrow_created"),),
+            (escrow_id,),
+        );
+
+        escrow_id
+    }
+
+    /// Reveal and release: verify commitment matches, then transfer funds.
+    /// The depositor must have already transferred funds to the contract.
+    #[allow(deprecated)]
+    pub fn reveal_and_release(
+        env: Env,
+        depositor: Address,
+        escrow_id: u64,
+        amount: i128,
+        blinding_factor: BytesN<32>,
+    ) {
+        depositor.require_auth();
+
+        let mut escrow: CommitmentEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentEscrow(escrow_id))
+            .expect("Commitment escrow not found");
+
+        assert!(amount > 0, "Amount must be greater than zero");
+        assert!(
+            escrow.status == CommitmentEscrowStatus::Active,
+            "Commitment escrow is not active"
+        );
+
+        let current_time = env.ledger().timestamp();
+        assert!(
+            current_time >= escrow.release_time,
+            "Release time has not been reached"
+        );
+
+        // Recompute commitment and verify it matches
+        let computed_commitment = Self::compute_commitment(&env, amount, blinding_factor);
+        assert!(
+            computed_commitment == escrow.commitment,
+            "Commitment verification failed"
+        );
+
+        // Verify contract holds sufficient balance
+        let token_client = token::Client::new(&env, &escrow.token);
+        let balance = token_client.balance(&env.current_contract_address());
+        assert!(balance >= amount, "Insufficient balance in contract");
+
+        // Transfer amount to beneficiary
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.beneficiary,
+            &amount,
+        );
+
+        escrow.status = CommitmentEscrowStatus::Revealed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentEscrow(escrow_id), &escrow);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "commitment_escrow_revealed"),),
+            (escrow_id,),
+        );
+    }
+
+    /// Admin-only: refund commitment escrow on Active status.
+    #[allow(deprecated)]
+    pub fn refund_commitment_escrow(env: Env, escrow_id: u64) {
+        let mut escrow: CommitmentEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentEscrow(escrow_id))
+            .expect("Commitment escrow not found");
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+
+        assert!(
+            escrow.status == CommitmentEscrowStatus::Active,
+            "Commitment escrow is not active"
+        );
+
+        // Transfer all remaining balance back to depositor
+        let token_client = token::Client::new(&env, &escrow.token);
+        let balance = token_client.balance(&env.current_contract_address());
+        if balance > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.depositor,
+                &balance,
+            );
+        }
+
+        escrow.status = CommitmentEscrowStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentEscrow(escrow_id), &escrow);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "commitment_escrow_refunded"),),
+            (escrow_id,),
+        );
+    }
+
+    /// Get commitment escrow details.
+    pub fn get_commitment_escrow(env: Env, escrow_id: u64) -> CommitmentEscrow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentEscrow(escrow_id))
+            .expect("Commitment escrow not found")
+    }
+
+    /// Allocate and return the next commitment escrow ID.
+    fn next_commitment_id(env: &Env) -> u64 {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CommitmentEscrowCount)
+            .unwrap_or(0);
+        let id = count + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::CommitmentEscrowCount, &id);
+        id
+    }
 }
 
 #[cfg(test)]
@@ -713,5 +925,330 @@ mod tests {
             &depositor, &beneficiary, &token, &10, &0u64,
             &id_b, &EscrowStatus::Released,
         );
+    }
+
+    // ── Commitment-based Escrow Tests ─────────────────────────────────────────
+
+    /// Valid reveal and release: commitment matches, amount released.
+    #[test]
+    fn test_commitment_escrow_valid_reveal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let amount = 100i128;
+        let blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        // Compute commitment
+        let commitment = env.as_contract(&contract_id, || {
+            // We can compute it here since compute_commitment is private
+            // We'll use a workaround: call create_commitment_escrow and track the commitment
+            BytesN::from_array(
+                &env,
+                &[
+                    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+                    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+                ],
+            ) // placeholder
+        });
+
+        // Create commitment escrow with computed commitment
+        // First, compute the actual commitment by doing the hash calculation
+        let mut commitment_data: Vec<u8> = vec![&env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            commitment_data.push_back(*byte);
+        }
+        for i in 0..32 {
+            commitment_data.push_back(blinding_factor.get(i).unwrap());
+        }
+        let commitment = env.crypto().sha256(&commitment_data);
+
+        let escrow_id = client.create_commitment_escrow(
+            &depositor,
+            &beneficiary,
+            &token,
+            &commitment,
+            &0u64,
+        );
+
+        // Depositor transfers funds to contract
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(&depositor, &contract_id, &amount);
+
+        // Verify and release with correct amount and blinding factor
+        client.reveal_and_release(&depositor, &escrow_id, &amount, &blinding_factor);
+
+        let escrow = client.get_commitment_escrow(&escrow_id);
+        assert_eq!(escrow.status, CommitmentEscrowStatus::Revealed);
+    }
+
+    /// Invalid reveal: wrong amount should be rejected.
+    #[test]
+    #[should_panic(expected = "Commitment verification failed")]
+    fn test_commitment_escrow_wrong_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let amount = 100i128;
+        let wrong_amount = 200i128;
+        let blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        let mut commitment_data: Vec<u8> = vec![&env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            commitment_data.push_back(*byte);
+        }
+        for i in 0..32 {
+            commitment_data.push_back(blinding_factor.get(i).unwrap());
+        }
+        let commitment = env.crypto().sha256(&commitment_data);
+
+        let escrow_id = client.create_commitment_escrow(
+            &depositor,
+            &beneficiary,
+            &token,
+            &commitment,
+            &0u64,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(&depositor, &contract_id, &amount);
+
+        // Try to reveal with wrong amount — should panic
+        client.reveal_and_release(&depositor, &escrow_id, &wrong_amount, &blinding_factor);
+    }
+
+    /// Invalid reveal: wrong blinding factor should be rejected.
+    #[test]
+    #[should_panic(expected = "Commitment verification failed")]
+    fn test_commitment_escrow_wrong_blinding_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let amount = 100i128;
+        let blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+        let wrong_blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13,
+                12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+            ],
+        );
+
+        let mut commitment_data: Vec<u8> = vec![&env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            commitment_data.push_back(*byte);
+        }
+        for i in 0..32 {
+            commitment_data.push_back(blinding_factor.get(i).unwrap());
+        }
+        let commitment = env.crypto().sha256(&commitment_data);
+
+        let escrow_id = client.create_commitment_escrow(
+            &depositor,
+            &beneficiary,
+            &token,
+            &commitment,
+            &0u64,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(&depositor, &contract_id, &amount);
+
+        // Try to reveal with wrong blinding factor — should panic
+        client.reveal_and_release(&depositor, &escrow_id, &amount, &wrong_blinding_factor);
+    }
+
+    /// Double reveal should be rejected (status no longer Active).
+    #[test]
+    #[should_panic(expected = "Commitment escrow is not active")]
+    fn test_commitment_escrow_double_reveal_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let amount = 100i128;
+        let blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        let mut commitment_data: Vec<u8> = vec![&env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            commitment_data.push_back(*byte);
+        }
+        for i in 0..32 {
+            commitment_data.push_back(blinding_factor.get(i).unwrap());
+        }
+        let commitment = env.crypto().sha256(&commitment_data);
+
+        let escrow_id = client.create_commitment_escrow(
+            &depositor,
+            &beneficiary,
+            &token,
+            &commitment,
+            &0u64,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(&depositor, &contract_id, &amount);
+
+        // First reveal succeeds
+        client.reveal_and_release(&depositor, &escrow_id, &amount, &blinding_factor);
+
+        // Second reveal attempt should panic
+        client.reveal_and_release(&depositor, &escrow_id, &amount, &blinding_factor);
+    }
+
+    /// Release time enforced for commitment escrow.
+    #[test]
+    fn test_commitment_escrow_release_time_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(500);
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let amount = 100i128;
+        let blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        let mut commitment_data: Vec<u8> = vec![&env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            commitment_data.push_back(*byte);
+        }
+        for i in 0..32 {
+            commitment_data.push_back(blinding_factor.get(i).unwrap());
+        }
+        let commitment = env.crypto().sha256(&commitment_data);
+
+        let escrow_id = client.create_commitment_escrow(
+            &depositor,
+            &beneficiary,
+            &token,
+            &commitment,
+            &1000u64, // release_time = 1000, current = 500
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(&depositor, &contract_id, &amount);
+
+        // Attempt to release before release_time should fail
+        let result = client.try_reveal_and_release(&depositor, &escrow_id, &amount, &blinding_factor);
+        assert!(result.is_err());
+    }
+
+    /// Admin refund of commitment escrow.
+    #[test]
+    fn test_commitment_escrow_admin_refund() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let amount = 100i128;
+        let blinding_factor = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        let mut commitment_data: Vec<u8> = vec![&env];
+        let amount_bytes = amount.to_be_bytes();
+        for byte in amount_bytes.iter() {
+            commitment_data.push_back(*byte);
+        }
+        for i in 0..32 {
+            commitment_data.push_back(blinding_factor.get(i).unwrap());
+        }
+        let commitment = env.crypto().sha256(&commitment_data);
+
+        let escrow_id = client.create_commitment_escrow(
+            &depositor,
+            &beneficiary,
+            &token,
+            &commitment,
+            &0u64,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        token_client.transfer(&depositor, &contract_id, &amount);
+
+        // Admin refunds
+        client.refund_commitment_escrow(&escrow_id);
+
+        let escrow = client.get_commitment_escrow(&escrow_id);
+        assert_eq!(escrow.status, CommitmentEscrowStatus::Refunded);
+    }
+
+    /// Amount is hidden: only commitment visible on-chain.
+    #[test]
+    fn test_commitment_escrow_amount_hidden() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let commitment = BytesN::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        let escrow_id =
+            client.create_commitment_escrow(&depositor, &beneficiary, &token, &commitment, &0u64);
+
+        let escrow = client.get_commitment_escrow(&escrow_id);
+
+        // Verify commitment is stored, no amount field exists
+        assert_eq!(escrow.commitment, commitment);
+        // The CommitmentEscrow struct has no amount field, so it's inherently hidden
     }
 }
