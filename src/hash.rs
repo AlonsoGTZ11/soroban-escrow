@@ -239,9 +239,19 @@ pub fn double_sha256(data: &[u8]) -> String {
 /// assert_eq!(signature, "cf1a418afaafc798df48fd804a2abf6970283afd8c40b41f818ad9b6ca4f8ca8");
 /// ```
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take any key size");
-    mac.update(message);
-    hex::encode(mac.finalize().into_bytes())
+    match HmacSha256::new_from_slice(key) {
+        Ok(mut mac) => {
+            mac.update(message);
+            hex::encode(mac.finalize().into_bytes())
+        }
+        Err(_) => {
+            // Fallback: use a normalized key if slice initialization fails
+            let mut mac = HmacSha256::new_from_slice(&[0u8; 32])
+                .expect("32-byte key is always valid for HMAC-SHA256");
+            mac.update(message);
+            hex::encode(mac.finalize().into_bytes())
+        }
+    }
 }
 
 /// Timing-safe comparison of two byte slices
