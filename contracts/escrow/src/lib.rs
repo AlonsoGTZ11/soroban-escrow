@@ -36,6 +36,7 @@ pub struct Escrow {
     pub beneficiary: Address,
     pub token: Address,
     pub amount: i128,
+    pub released_amount: i128,
     pub status: EscrowStatus,
     pub release_time: u64,
     /// ID of the parent escrow, or 0 if this is a root escrow.
@@ -138,6 +139,7 @@ impl EscrowContract {
             beneficiary,
             token,
             amount,
+            released_amount: 0,
             status: EscrowStatus::Active,
             release_time,
             parent_escrow_id: 0,
@@ -222,6 +224,7 @@ impl EscrowContract {
             beneficiary,
             token,
             amount,
+            released_amount: 0,
             status: EscrowStatus::Active,
             release_time,
             parent_escrow_id: parent_id,
@@ -422,6 +425,77 @@ impl EscrowContract {
         #[allow(deprecated)]
         env.events()
             .publish((Symbol::new(&env, "escrow_disputed"),), (escrow_id,));
+    }
+
+    /// Release a portion of the escrowed funds to the beneficiary.
+    /// The depositor can call this multiple times until the full amount is released.
+    /// If the remaining amount reaches zero, the escrow status is set to Released.
+    #[allow(deprecated)]
+    pub fn partial_release(env: Env, escrow_id: u64, amount: i128) {
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        escrow.depositor.require_auth();
+        assert!(
+            escrow.status == EscrowStatus::Active,
+            "Escrow is not active"
+        );
+
+        assert!(amount > 0, "Amount must be greater than zero");
+
+        let remaining = escrow.amount - escrow.released_amount;
+        assert!(
+            amount <= remaining,
+            "Amount exceeds remaining escrow balance"
+        );
+
+        let current_time = env.ledger().timestamp();
+        assert!(
+            current_time >= escrow.release_time,
+            "Release time has not been reached"
+        );
+
+        if let ParentStatusRequirement::Status(ref required) = escrow.required_parent_status {
+            let parent: Escrow = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Escrow(escrow.parent_escrow_id))
+                .expect("Parent escrow not found");
+            assert!(
+                &parent.status == required,
+                "Parent escrow has not reached the required status"
+            );
+        }
+
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.beneficiary,
+            &amount,
+        );
+
+        escrow.released_amount += amount;
+
+        if escrow.released_amount == escrow.amount {
+            escrow.status = EscrowStatus::Released;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "escrow_partially_released"),),
+            (escrow_id, amount, escrow.amount - escrow.released_amount),
+        );
+
+        if escrow.status == EscrowStatus::Released {
+            Self::trigger_children(env, escrow_id);
+        }
     }
 
     /// Get escrow details.
@@ -1130,6 +1204,101 @@ mod tests {
         );
         assert_eq!(client.get_escrow(&parent_id).status, EscrowStatus::Released);
         assert_eq!(client.get_escrow(&child_id).status, EscrowStatus::Released);
+    }
+
+    // ── Partial release tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_partial_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        client.partial_release(&escrow_id, &40);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+        assert_eq!(escrow.released_amount, 40);
+    }
+
+    #[test]
+    fn test_multiple_partial_releases() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+
+        client.partial_release(&escrow_id, &30);
+        assert_eq!(client.get_escrow(&escrow_id).released_amount, 30);
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Active);
+
+        client.partial_release(&escrow_id, &50);
+        assert_eq!(client.get_escrow(&escrow_id).released_amount, 80);
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Active);
+    }
+
+    #[test]
+    fn test_full_amount_partial_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        client.partial_release(&escrow_id, &100);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert_eq!(escrow.released_amount, 100);
+    }
+
+    #[test]
+    fn test_partial_release_exceeds_balance_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+
+        client.partial_release(&escrow_id, &60);
+        let result = client.try_partial_release(&escrow_id, &50);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_partial_release_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &0u64);
+        let result = client.try_partial_release(&escrow_id, &0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_partial_release_time_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(500);
+        let (admin, depositor, beneficiary, token, contract_id) = setup(&env);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &token, &100, &1000u64);
+        let result = client.try_partial_release(&escrow_id, &30);
+        assert!(result.is_err());
     }
 
     /// Circular dependency is detected and rejected.
