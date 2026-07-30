@@ -26,3 +26,6 @@ target
 /target
 CLAUDE.md
 plan.md
+
+# Soroban SDK testutils ledger snapshot dumps
+**/test_snapshots/
