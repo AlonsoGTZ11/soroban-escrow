@@ -1666,3 +1666,4 @@ mod tests {
         // The CommitmentEscrow struct has no amount field, so it's inherently hidden
     }
 }
+
