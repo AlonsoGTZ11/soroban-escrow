@@ -2,6 +2,8 @@
 members = [
     ".",
     "contracts/escrow",
+    "contracts/escrow-instance",
+    "contracts/escrow-factory",
 ]
 resolver = "2"
 
