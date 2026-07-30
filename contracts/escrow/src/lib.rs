@@ -74,6 +74,18 @@ pub struct EscrowContract;
 #[contractimpl]
 impl EscrowContract {
     /// Initialize the contract with an admin address.
+    ///
+    /// Sets up the escrow contract with an admin address who can refund escrows.
+    /// Must be called before any escrows are created.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `admin` - The address to be set as contract admin
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `admin` address fails authentication (does not sign the transaction).
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -81,6 +93,29 @@ impl EscrowContract {
     }
 
     /// Create a new root escrow (no parent dependency).
+    ///
+    /// Creates an escrow agreement where a depositor transfers funds to the contract.
+    /// The funds are released to the beneficiary after the `release_time` is reached.
+    /// Depositor must authorize this transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `depositor` - Address of the party depositing funds
+    /// * `beneficiary` - Address of the party receiving funds
+    /// * `token` - Token contract address for the escrow asset
+    /// * `amount` - Amount in stroops/base units to escrow (must be positive)
+    /// * `release_time` - Unix timestamp when funds can be released (0 = immediate)
+    ///
+    /// # Returns
+    ///
+    /// The escrow ID (u64) for referencing this escrow in future transactions.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `depositor` fails authentication (does not sign the transaction)
+    /// * Panics if `amount` <= 0
+    /// * Panics if token transfer fails (insufficient balance, invalid token, etc.)
     #[allow(deprecated)]
     pub fn create_escrow(
         env: Env,
@@ -121,6 +156,33 @@ impl EscrowContract {
     }
 
     /// Create a child escrow that is gated on a parent reaching `required_status`.
+    ///
+    /// Creates an escrow that depends on a parent escrow reaching a specific status before
+    /// the child can be released. Enables complex multi-stage escrow workflows. Circular
+    /// dependencies are detected and rejected. Depositor must authorize this transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `depositor` - Address of the party depositing funds
+    /// * `beneficiary` - Address of the party receiving funds
+    /// * `token` - Token contract address for the escrow asset
+    /// * `amount` - Amount in stroops/base units to escrow (must be positive)
+    /// * `release_time` - Unix timestamp when funds can be released
+    /// * `parent_id` - ID of the parent escrow this child depends on
+    /// * `required_status` - The status the parent must reach before child can release
+    ///
+    /// # Returns
+    ///
+    /// The new escrow ID (u64) for the created child escrow.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `depositor` fails authentication
+    /// * Panics if `amount` <= 0
+    /// * Panics if parent escrow not found
+    /// * Panics if circular dependency detected (new escrow is ancestor of parent)
+    /// * Panics if token transfer fails
     #[allow(deprecated)]
     pub fn create_child_escrow(
         env: Env,
@@ -191,7 +253,26 @@ impl EscrowContract {
     }
 
     /// Release funds to beneficiary.
-    /// For child escrows, validates parent has reached the required status first.
+    ///
+    /// Transfers escrowed funds from the contract to the beneficiary address.
+    /// Only available after `release_time` has been reached.
+    /// For child escrows, verifies the parent has reached the required status first.
+    /// Depositor must authorize this transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - ID of the escrow to release
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `depositor` fails authentication (does not sign the transaction)
+    /// * Panics if escrow not found
+    /// * Panics if escrow status is not `Active`
+    /// * Panics if current time < `release_time`
+    /// * Panics if escrow has parent dependency and parent status does not match required status
+    /// * Panics if token transfer fails
+    /// * Panics if child escrow recursion depth exceeds 64 levels
     #[allow(deprecated)]
     pub fn release(env: Env, escrow_id: u64) {
         let mut escrow: Escrow = env
@@ -246,7 +327,23 @@ impl EscrowContract {
     }
 
     /// Refund to depositor — admin only, works on Active or Disputed escrows.
-    /// After refund, triggers any children that require Refunded parent status.
+    ///
+    /// Returns escrowed funds to the original depositor. Only the contract admin can call this.
+    /// Works on escrows in `Active` or `Disputed` status. After refund, automatically triggers
+    /// any child escrows that require `Refunded` parent status.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - ID of the escrow to refund
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `admin` fails authentication (does not sign the transaction)
+    /// * Panics if admin not set in contract storage
+    /// * Panics if escrow not found
+    /// * Panics if escrow status is not `Active` or `Disputed`
+    /// * Panics if token transfer fails
     #[allow(deprecated)]
     pub fn refund(env: Env, escrow_id: u64) {
         let mut escrow: Escrow = env
@@ -288,6 +385,21 @@ impl EscrowContract {
     }
 
     /// Raise a dispute — beneficiary only.
+    ///
+    /// Marks an escrow as disputed, preventing automatic release and preparing it for admin review.
+    /// Only the beneficiary can dispute an escrow. Once disputed, admin can refund the depositor.
+    /// Beneficiary must authorize this transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - ID of the escrow to dispute
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `beneficiary` fails authentication (does not sign the transaction)
+    /// * Panics if escrow not found
+    /// * Panics if escrow status is not `Active`
     #[allow(deprecated)]
     pub fn dispute(env: Env, escrow_id: u64) {
         let mut escrow: Escrow = env
@@ -313,6 +425,29 @@ impl EscrowContract {
     }
 
     /// Get escrow details.
+    ///
+    /// Retrieves the full escrow struct containing all details about an escrow agreement.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - ID of the escrow to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The `Escrow` struct containing:
+    /// - `depositor`: Original depositor address
+    /// - `beneficiary`: Beneficiary address
+    /// - `token`: Token contract address
+    /// - `amount`: Escrowed amount in base units
+    /// - `status`: Current escrow status (Active, Released, Refunded, or Disputed)
+    /// - `release_time`: Unix timestamp when release becomes available
+    /// - `parent_escrow_id`: ID of parent escrow (0 for root escrows)
+    /// - `required_parent_status`: Status parent must reach before this child can release
+    ///
+    /// # Panics
+    ///
+    /// Panics if escrow with given ID is not found.
     pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
         env.storage()
             .persistent()
@@ -321,6 +456,17 @@ impl EscrowContract {
     }
 
     /// Get total escrow count.
+    ///
+    /// Returns the total number of root escrows that have been created in this contract.
+    /// This is the ID counter used to generate unique escrow IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    ///
+    /// Total count of escrows created (u64). Returns 0 if contract has not been initialized.
     pub fn get_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -329,6 +475,18 @@ impl EscrowContract {
     }
 
     /// Get child escrow IDs for a given parent.
+    ///
+    /// Returns a list of all child escrow IDs that depend on the specified parent escrow.
+    /// Useful for tracking dependent escrows in a hierarchy.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `parent_id` - ID of the parent escrow
+    ///
+    /// # Returns
+    ///
+    /// A vector of child escrow IDs. Returns empty vector if no children exist.
     pub fn get_child_escrows(env: Env, parent_id: u64) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -459,7 +617,28 @@ impl EscrowContract {
     }
 
     /// Create a commitment-based escrow with hidden amount.
+    ///
+    /// Creates a privacy-preserving escrow where the amount is hidden using a Pedersen
+    /// commitment (SHA-256 hash). The amount is not stored on-chain, only the commitment.
     /// Depositor must separately transfer funds to the contract (amount unknown to observers).
+    /// Depositor must authorize this transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `depositor` - Address of the party depositing funds
+    /// * `beneficiary` - Address of the party receiving funds
+    /// * `token` - Token contract address for the escrow asset
+    /// * `commitment` - SHA-256 commitment hash: commit(amount, blinding_factor)
+    /// * `release_time` - Unix timestamp when funds can be released (0 = immediate)
+    ///
+    /// # Returns
+    ///
+    /// The commitment escrow ID (u64) for referencing this escrow in future transactions.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `depositor` fails authentication (does not sign the transaction)
     #[allow(deprecated)]
     pub fn create_commitment_escrow(
         env: Env,
@@ -496,7 +675,30 @@ impl EscrowContract {
     }
 
     /// Reveal and release: verify commitment matches, then transfer funds.
-    /// The depositor must have already transferred funds to the contract.
+    ///
+    /// Releases a commitment escrow by proving the amount and blinding factor match the
+    /// stored commitment. Verifies the commitment cryptographically and validates the contract
+    /// holds sufficient balance before transferring to beneficiary. Depositor must authorize
+    /// this transaction. Can only be called once per escrow.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `depositor` - Address of the party depositing funds (must match creator)
+    /// * `escrow_id` - ID of the commitment escrow to release
+    /// * `amount` - The actual amount to release in stroops/base units
+    /// * `blinding_factor` - The 32-byte blinding factor used to create the commitment
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `depositor` fails authentication
+    /// * Panics if escrow not found
+    /// * Panics if escrow status is not `Active`
+    /// * Panics if current time < `release_time`
+    /// * Panics if `amount` <= 0
+    /// * Panics if recomputed commitment does not match stored commitment
+    /// * Panics if contract balance < amount (insufficient funds)
+    /// * Panics if token transfer fails
     #[allow(deprecated)]
     pub fn reveal_and_release(
         env: Env,
@@ -557,6 +759,23 @@ impl EscrowContract {
     }
 
     /// Admin-only: refund commitment escrow on Active status.
+    ///
+    /// Refunds a commitment escrow to the depositor. Only the contract admin can call this.
+    /// Transfers all remaining contract balance for this escrow to the depositor.
+    /// Only works on escrows in `Active` status.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - ID of the commitment escrow to refund
+    ///
+    /// # Panics
+    ///
+    /// * Panics if `admin` fails authentication (does not sign the transaction)
+    /// * Panics if admin not set in contract storage
+    /// * Panics if escrow not found
+    /// * Panics if escrow status is not `Active`
+    /// * Panics if token transfer fails
     #[allow(deprecated)]
     pub fn refund_commitment_escrow(env: Env, escrow_id: u64) {
         let mut escrow: CommitmentEscrow = env
@@ -597,6 +816,27 @@ impl EscrowContract {
     }
 
     /// Get commitment escrow details.
+    ///
+    /// Retrieves the full commitment escrow struct containing all details.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - ID of the commitment escrow to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The `CommitmentEscrow` struct containing:
+    /// - `depositor`: Original depositor address
+    /// - `beneficiary`: Beneficiary address
+    /// - `token`: Token contract address
+    /// - `commitment`: SHA-256 commitment hash (amount and blinding factor are hidden)
+    /// - `status`: Current escrow status (Active, Revealed, or Refunded)
+    /// - `release_time`: Unix timestamp when release becomes available
+    ///
+    /// # Panics
+    ///
+    /// Panics if escrow with given ID is not found.
     pub fn get_commitment_escrow(env: Env, escrow_id: u64) -> CommitmentEscrow {
         env.storage()
             .persistent()
